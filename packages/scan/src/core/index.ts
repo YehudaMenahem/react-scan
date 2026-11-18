@@ -407,7 +407,11 @@ export const setOptions = (userOptions: Partial<Options>) => {
       applyLocalStorageOptions(newOptions),
     );
 
-    if (shouldInitToolbar) {
+    // Only remount the toolbar when instrumentation is already running.
+    // Calling initToolbar here before start() succeeds creates an orphan
+    // toolbar with no outline canvas — the Storybook/iframe symptom in #419,
+    // where production detection blocked start() but showToolbar still painted.
+    if (shouldInitToolbar && ReactScanInternals.instrumentation) {
       initToolbar(!!newOptions.showToolbar);
     }
 
@@ -429,6 +433,44 @@ export const getOptions = () => ReactScanInternals.options;
 
 let isProduction: boolean | null = null;
 let rdtHook: ReturnType<typeof getRDTHook>;
+let developmentRendererListenerAttached = false;
+
+interface RendererIdentity {
+  version?: unknown;
+  bundleType?: unknown;
+}
+
+// bippy's React Refresh bootstrap injects a stub renderer with neither
+// `version` nor `bundleType`. detectReactBuildType treats those stubs as
+// production, which made getIsProduction() return true before the app's real
+// React renderer registered (common in Storybook/Vite previews — see #419).
+const isIdentifiableReactRenderer = (renderer: RendererIdentity) => {
+  return typeof renderer.version === "string" && typeof renderer.bundleType === "number";
+};
+
+const shouldBlockForProduction = () => {
+  return (
+    !ReactScanInternals.runInAllEnvironments &&
+    Boolean(getIsProduction()) &&
+    !ReactScanInternals.options.value.dangerouslyForceRunInProduction
+  );
+};
+
+const attachDevelopmentRendererListener = () => {
+  if (developmentRendererListenerAttached) {
+    return;
+  }
+  developmentRendererListenerAttached = true;
+  // Retry start() when a later renderer arrives. A production-only overlay
+  // (or Refresh stub) may register first; the app's development React often
+  // injects on a subsequent tick.
+  getRDTHook(() => {
+    if (!shouldBlockForProduction()) {
+      start();
+    }
+  });
+};
+
 export const getIsProduction = () => {
   // Once we've definitively seen a non-production renderer, the app is "dev"
   // forever — cache that and short-circuit. We deliberately do NOT cache the
@@ -439,7 +481,7 @@ export const getIsProduction = () => {
     return false;
   }
   rdtHook ??= getRDTHook();
-  const renderers = Array.from(rdtHook.renderers.values());
+  const renderers = Array.from(rdtHook.renderers.values()).filter(isIdentifiableReactRenderer);
   if (renderers.length === 0) {
     return null;
   }
@@ -459,11 +501,8 @@ export const start = () => {
       return;
     }
 
-    if (
-      !ReactScanInternals.runInAllEnvironments &&
-      getIsProduction() &&
-      !ReactScanInternals.options.value.dangerouslyForceRunInProduction
-    ) {
+    if (shouldBlockForProduction()) {
+      attachDevelopmentRendererListener();
       return;
     }
 
